@@ -1,0 +1,7 @@
+language: rust
+rust:
+  - stable
+  - nightly
+  - beta
+matrix:
+  fast_finish: true
