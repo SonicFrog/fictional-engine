@@ -1,0 +1,10 @@
+[package]
+name = "logmap"
+version = "0.1.0"
+authors = ["Ogier Bouvier <ogier.bouvier@epfl.ch>"]
+
+[dependencies]
+"owning_ref" = "*"
+"rand" = "0.5.0-pre.0"
+"time" = "*"
+"crossbeam-utils" = "0.3.2"
