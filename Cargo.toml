@@ -2,6 +2,9 @@
 name = "logmap"
 version = "0.1.0"
 authors = ["Ogier Bouvier <ogier.bouvier@epfl.ch>"]
+description = "A concurrent hashmap using a log for buckets"
+homepage = "https://github.com/SonicFrog/fictional-engine"
+license = "MIT"
 
 [dependencies]
 "owning_ref" = "*"
