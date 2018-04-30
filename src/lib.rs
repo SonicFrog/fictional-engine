@@ -353,6 +353,7 @@ mod tests {
     use std::io::Write;
     use std::time::{Duration, SystemTime};
     use std::iter;
+    use std::sync::Arc;
     use std::thread;
 
     use self::crossbeam_utils::scoped::ScopedJoinHandle;
@@ -460,7 +461,16 @@ mod tests {
     }
 
     #[test]
+    fn skewed_concurrent_puts() {
+        // TODO: modularize `concurrent_puts` for skewed key load
+    }
+
+    #[test]
     fn concurrent_puts() {
+        const THREAD_NUM: i64 = 16;
+        const NUM_PUT: i64 = 8192 * 2 * 19;
+        const NUM_GET: i64 = NUM_PUT;
+
         let mut rng = rand::thread_rng();
         let keys: Vec<String> = (0..8192)
             .map(|_| {
@@ -470,10 +480,16 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        let map: LoanMap<String, u32> = LoanMap::with_capacity(keys.len() * 2, 16);
-        const THREAD_NUM: i64 = 16;
-        const NUM_PUT: i64 = 8192 * 2;
-        const NUM_GET: i64 = 19 * NUM_PUT;
+        let rand_key_set = |count: usize| {
+            let mut rng = rand::thread_rng();
+
+            (0..count).map(|_| keys[rng.gen_range(0, keys.len())].clone()).collect()
+        };
+
+        let map: Arc<LoanMap<String, u32>> = Arc::new(LoanMap::with_capacity(keys.len() * 2, 16));
+        let indices: Vec<Vec<String>> = (0..THREAD_NUM)
+            .map(|_| rand_key_set(NUM_PUT as usize))
+            .collect();
 
         for i in &keys {
             map.put(i.clone(), 0);
@@ -483,11 +499,13 @@ mod tests {
             let mut guards: Vec<ScopedJoinHandle<()>> = Vec::new();
 
             for i in 0..THREAD_NUM {
+                let map = map.clone();
                 let idx = i.clone();
+                let keys = indices[idx as usize].clone();
                 let mut filename = File::create(format!("{}.csv", idx).to_string()).unwrap();
 
                 if i % 2 == 0 {
-                    guards.push(s.spawn(|| {
+                    guards.push(s.spawn(move || {
                         let mut rng = rand::thread_rng();
                         let mut file = filename;
                         let mut results: Vec<u32> = Vec::new();
@@ -509,16 +527,16 @@ mod tests {
                         }
                     }));
                 } else {
-                    guards.push(s.spawn(|| {
+                    guards.push(s.spawn(move || {
                         let mut file = filename;
                         let mut results: Vec<u32> = Vec::with_capacity(NUM_GET as usize);
 
                         for i in 0..NUM_GET {
-                            let key = &keys[i as usize % keys.len()];
+                            let key = keys[i as usize % keys.len()].clone();
                             let start = SystemTime::now();
 
                             {
-                                let _guard = map.get(key).expect("missing key");
+                                let _guard = map.get(&key).expect("missing key");
                                 results.push(start.elapsed().unwrap().subsec_nanos());
                                 // Hold the lock for "network" sending
                                 thread::sleep(Duration::new(0, 500));
