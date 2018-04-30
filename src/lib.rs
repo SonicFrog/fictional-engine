@@ -63,7 +63,7 @@ impl<K, V> VersionTable<K, V>
     {
         let start = self.current_head();
 
-        for i in (0..start + 1).rev().chain((start + 1..self.bucket.len()).rev()) {
+        for i in (0..start).rev().chain((start + 1..self.bucket.len()).rev()) {
             let bucket = self.bucket[i].read().unwrap();
 
             if f(&bucket) {
@@ -75,9 +75,8 @@ impl<K, V> VersionTable<K, V>
     }
 
     fn remove(&self, key: K) -> Option<V> {
-        let mut bucket = self.scan_mut(|x| {
-            x.is_free()
-        });
+        let head = self.next_head();
+        let mut bucket = self.bucket[head].write().unwrap();
 
         mem::replace(&mut *bucket, Bucket::Removed(key)).value()
     }
@@ -218,16 +217,6 @@ impl<K, V> Table<K, V>
 
     fn lookup(&self, key: &K) -> RwLockReadGuard<Bucket<K, V>> {
         self.buckets[self.hash(key)].newest(key)
-    }
-
-    fn lookup_or_free(&self, key: &K) -> RwLockWriteGuard<Bucket<K, V>> {
-        self.scan_mut(key, |x| {
-            if let Bucket::Contains(ref ckey, _) = *x {
-                ckey == key
-            } else {
-                true
-            }
-        })
     }
 
     fn remove(&self, key: K) -> Option<V> {
