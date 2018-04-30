@@ -45,9 +45,26 @@ impl<K, V> VersionTable<K, V>
     {
         let start = self.current_head();
 
-        for i in (0..self.bucket.len()).rev() {
+        for i in 0..self.bucket.len() {
             let idx = (i + start) % self.bucket.len();
             let bucket = self.bucket[idx].read().unwrap();
+
+            if f(&bucket) {
+                return bucket;
+            }
+        }
+
+        self.bucket[start].read().unwrap()
+    }
+
+    fn rev_scan<F>(&self, f: F) -> RwLockReadGuard<Bucket<K, V>>
+        where
+        F: Fn(&Bucket<K, V>) -> bool,
+    {
+        let start = self.current_head();
+
+        for i in (0..start + 1).rev().chain((start + 1..self.bucket.len()).rev()) {
+            let bucket = self.bucket[i].read().unwrap();
 
             if f(&bucket) {
                 return bucket;
@@ -71,8 +88,8 @@ impl<K, V> VersionTable<K, V>
     {
         let start = self.current_head();
 
-        for i in (0..self.bucket.len()).rev() {
-            let idx = (i + start) % self.bucket.len();
+        for i in 0..self.bucket.len() {
+            let idx = (start + i) % self.bucket.len();
             if let Ok(guard) = self.bucket[idx].try_write() {
                 if f(&guard) {
                     return guard;
@@ -80,7 +97,6 @@ impl<K, V> VersionTable<K, V>
             }
         }
 
-        // FIXME: choose bucket intelligently when none matches?
         self.bucket[start].write().unwrap()
     }
 
@@ -91,17 +107,12 @@ impl<K, V> VersionTable<K, V>
         mem::replace(&mut *bucket, Bucket::Contains(key, value)).value()
     }
 
-    fn newest(&self, key: &K) -> Option<RwLockReadGuard<Bucket<K, V>>> {
-        let bucket = self.scan(|x| match *x {
+    fn newest(&self, key: &K) -> RwLockReadGuard<Bucket<K, V>> {
+        self.rev_scan(|x| match *x {
             Bucket::Contains(ref ckey, _) => ckey == key,
+            Bucket::Removed(ref ckey) => ckey == key,
             _ => false,
-        });
-
-        if bucket.key_matches(key) {
-            Some(bucket)
-        } else {
-            None
-        }
+        })
     }
 }
 
@@ -111,7 +122,7 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for VersionTable<K, V> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Bucket<K, V> {
     Empty,
     Removed(K),
@@ -154,10 +165,10 @@ impl<K, V> Bucket<K, V> {
         where
         K: PartialEq,
     {
-        if let Bucket::Contains(ref ckey, _) = *self {
-            ckey == key
-        } else {
-            false
+        match *self {
+            Bucket::Contains(ref ckey, _) => ckey == key,
+            Bucket::Removed(ref ckey) => ckey == ckey,
+            _ => false,
         }
     }
 }
@@ -206,12 +217,7 @@ impl<K, V> Table<K, V>
     }
 
     fn lookup(&self, key: &K) -> RwLockReadGuard<Bucket<K, V>> {
-        self.scan(key, |x| match *x {
-            Bucket::Contains(ref ckey, _) if ckey == key => true,
-            Bucket::Removed(ref ckey) if ckey == key => true,
-            Bucket::Empty => true,
-            _ => false,
-        })
+        self.buckets[self.hash(key)].newest(key)
     }
 
     fn lookup_or_free(&self, key: &K) -> RwLockWriteGuard<Bucket<K, V>> {
@@ -358,16 +364,15 @@ mod tests {
     use std::io::Write;
     use std::time::{Duration, SystemTime};
     use std::iter;
-    use std::sync::Arc;
-    use std::sync::mpsc::channel;
     use std::thread;
 
     use self::crossbeam_utils::scoped::ScopedJoinHandle;
     use self::crossbeam_utils::scoped;
     use self::rand::distributions::Alphanumeric;
-    use self::rand::{Rng, ThreadRng};
+    use self::rand::Rng;
     use self::test::Bencher;
 
+    use super::Bucket;
     use super::LoanMap;
     use super::VersionTable;
 
@@ -430,7 +435,9 @@ mod tests {
         let (key, value) = (String::from("key1"), String::from("value1"));
 
         assert_eq!(map.put(key.clone(), value.clone()), None);
-        assert_eq!(map.remove(key), Some(value));
+        map.remove(key.clone());
+
+        assert_eq!(map.get(&key), None);
     }
 
     #[test]
@@ -457,8 +464,9 @@ mod tests {
             table.remove(keys[i]);
         }
 
-        for key in keys {
-            assert_eq!(table.update(key, 0), None);
+        for i in 0..keys.len() {
+            let key = keys[i];
+            assert_eq!(*table.newest(&key), Bucket::Removed(key));
         }
     }
 
@@ -477,7 +485,6 @@ mod tests {
         const THREAD_NUM: i64 = 16;
         const NUM_PUT: i64 = 8192 * 2;
         const NUM_GET: i64 = 19 * NUM_PUT;
-        let (producer, consumer) = channel();
 
         for i in &keys {
             map.put(i.clone(), 0);
@@ -486,28 +493,15 @@ mod tests {
         scoped::scope(|s| {
             let mut guards: Vec<ScopedJoinHandle<()>> = Vec::new();
 
-            guards.push(s.spawn(move || {
-                let mut stats: File = File::create("stats.csv").unwrap();
-
-                write!(stats, "type;ns\n").unwrap();
-
-                loop {
-                    if let Ok((tp, to)) = consumer.recv() {
-                        write!(stats, "{};{}\n", tp, to).unwrap();
-                    } else {
-                        break;
-                    }
-                }
-            }));
-
-
             for i in 0..THREAD_NUM {
-                let tx = producer.clone();
+                let idx = i.clone();
+                let mut filename = File::create(format!("{}.csv", idx).to_string()).unwrap();
 
                 if i % 2 == 0 {
                     guards.push(s.spawn(|| {
                         let mut rng = rand::thread_rng();
-                        let tx = tx;
+                        let mut file = filename;
+                        let mut results: Vec<u32> = Vec::new();
 
                         for i in 0..NUM_PUT {
                             let key = keys[i as usize % keys.len()].clone();
@@ -518,27 +512,32 @@ mod tests {
                                 map.put(key, rng.gen::<u32>());
                             }
 
-                            let elapsed = start.elapsed().unwrap().subsec_nanos();
+                            results.push(start.elapsed().unwrap().subsec_nanos());
+                        }
 
-                            tx.send(("PUT", elapsed)).unwrap();
+                        for time in results {
+                            write!(file, "PUT;{}\n", time).unwrap();
                         }
                     }));
                 } else {
                     guards.push(s.spawn(|| {
-                        let tx = tx;
+                        let mut file = filename;
+                        let mut results: Vec<u32> = Vec::with_capacity(NUM_GET as usize);
+
                         for i in 0..NUM_GET {
                             let key = &keys[i as usize % keys.len()];
                             let start = SystemTime::now();
-                            let mut elapsed;
 
                             {
                                 let _guard = map.get(key).expect("missing key");
-                                elapsed = start.elapsed().unwrap().subsec_nanos();
-                                // simulate sending the packet through NetBricks
-                                thread::sleep(Duration::new(0, 5));
+                                results.push(start.elapsed().unwrap().subsec_nanos());
+                                // Hold the lock for "network" sending
+                                thread::sleep(Duration::new(0, 500));
                             }
+                        }
 
-                            tx.send(("GET", elapsed)).unwrap();
+                        for time in results {
+                            write!(file, "GET;{}\n", time).unwrap();
                         }
                     }));
                 }
@@ -595,6 +594,17 @@ mod tests {
     }
 
     #[test]
+    fn version_table_delete_value() {
+        let table: VersionTable<String, u32> = VersionTable::with_capacity(16);
+        let key = String::from("random key");
+        let value = 1024;
+
+        assert_eq!(table.update(key.clone(), value.clone()), None);
+        table.remove(key.clone());
+        assert_eq!(table.newest(&key).value_ref(), Err(()));
+    }
+
+    #[test]
     fn version_table_values_dont_interfere() {
         let table: VersionTable<String, String> = VersionTable::with_capacity(128);
         let mut rng = rand::thread_rng();
@@ -624,7 +634,6 @@ mod tests {
             assert_eq!(
                 table
                     .newest(&keys[i])
-                    .expect("failed to insert key")
                     .value_ref(),
                 Ok(&values[i])
             );
@@ -647,46 +656,7 @@ mod tests {
         for (key, value) in keys.iter().zip(values.iter().skip(size)) {
             table.update(key.clone(), value.clone());
             let opt = table.newest(&key);
-            assert_eq!(opt.expect("failed to insert key").value_ref(), Ok(value));
-        }
-    }
-
-    #[test]
-    fn version_table_overflow_overwrites_old_values() {
-        let size = 128;
-        let keys = gen_rand_strings(size * 2, size);
-        let values = gen_rand_strings(size * 2, size);
-        let table: VersionTable<String, String> = VersionTable::with_capacity(size);
-
-        let kv1: Vec<(String, String)> = gen_rand_strings(size, 128)
-            .iter()
-            .map(|x| String::from(x.clone()))
-            .zip(gen_rand_strings(size, 128))
-            .collect();
-        let kv2: Vec<(String, String)> = gen_rand_strings(size, 128)
-            .iter()
-            .map(|x| String::from(x.clone()))
-            .zip(gen_rand_strings(size, 128))
-            .collect();
-
-        assert_eq!(kv1.len(), kv2.len());
-
-        for kvset in vec![&kv1, &kv2] {
-            for &(ref key, ref value) in kvset {
-                table.update(key.clone(), value.clone());
-            }
-        }
-
-        // the first round of key should not be in the table anymore
-        for (key, value) in kv1 {
-            assert_eq!(table.newest(&key).is_none(), true);
-        }
-
-        for (key, value) in kv2 {
-            assert_eq!(
-                table.newest(&key).expect("key missing").value_ref(),
-                Ok(&value)
-            );
+            assert_eq!(opt.value_ref(), Ok(value));
         }
     }
 
@@ -704,7 +674,7 @@ mod tests {
         for value in &values {
             table.update(key.clone(), value.clone());
             assert_eq!(
-                table.newest(&key).expect("missing key").value_ref(),
+                table.newest(&key).value_ref(),
                 Ok(value)
             );
         }
