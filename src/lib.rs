@@ -1,11 +1,17 @@
+#![feature(allocator_api)]
 #![feature(test)]
+#![feature(box_syntax)]
 extern crate owning_ref;
 
 use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::fmt::Display;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::heap::{Heap, Alloc, Layout};
 use std::mem;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::Deref;
 use std::vec::Vec;
@@ -14,6 +20,101 @@ use self::owning_ref::{OwningHandle, OwningRef};
 
 const DEFAULT_TABLE_CAPACITY: usize = 128;
 const DEFAULT_BUCKET_CAPACITY: usize = 128;
+
+struct AtomicCell<K, V>
+    where K: PartialEq + Hash,
+{
+    ptr: AtomicPtr<Arc<Vec<Arc<Bucket<K, V>>>>>,
+}
+
+impl<K, V> AtomicCell<K, V>
+    where K: PartialEq + Hash,
+{
+    fn new() -> AtomicCell<K, V> {
+        let copy_from = Arc::new(Vec::new());
+        let ptr = unsafe { AtomicCell::make_vec(copy_from) };
+
+        AtomicCell {
+                ptr: AtomicPtr::new(ptr),
+        }
+    }
+
+    unsafe fn make_vec(content: Arc<Vec<Arc<Bucket<K, V>>>>) -> *mut Arc<Vec<Arc<Bucket<K, V>>>> {
+
+        let ptr =
+            Heap.alloc(Layout::new::<Arc<Vec<Arc<Bucket<K, V>>>>>()).unwrap()
+            as *mut Arc<Vec<Arc<Bucket<K, V>>>>;
+
+        ptr::copy_nonoverlapping(&content as *const Arc<Vec<Arc<Bucket<K, V>>>>,
+                                 ptr, 1);
+        mem::forget(content);
+        ptr
+    }
+
+    fn scan<F>(&self, matches: F) -> Option<Arc<Bucket<K, V>>>
+        where F: Fn(&Bucket<K, V>) -> bool,
+    {
+        let ptr = self.ptr.load(Ordering::Relaxed);
+
+        for item in unsafe { &*ptr }.iter() {
+            if matches(&item) {
+                return Some(item.clone());
+            }
+        }
+
+        None
+    }
+
+    fn get(&self, key: &K) -> Option<Arc<Bucket<K, V>>> {
+        self.scan(|x| x.key_matches(key))
+    }
+
+    fn put(&self, key: K, value: V) {
+        let bucket = Arc::new(Bucket::Contains(key, value));
+        let mut raw = self.ptr.load(Ordering::Relaxed);
+
+        while {
+            let ptr: Arc<Vec<Arc<Bucket<K, V>>>> = unsafe { &*raw }.clone();
+            let mut list: Arc<Vec<Arc<Bucket<K, V>>>> = Arc::new(Vec::new());
+
+            assert_eq!(ptr.len() < 10, true);
+
+            for i in ptr.iter() {
+
+            }
+
+            {
+                Arc::get_mut(&mut list).unwrap().insert(0, bucket.clone());
+            }
+
+            let new_raw = self.ptr.compare_and_swap(raw, &mut list as *mut Arc<_>,
+                                                    Ordering::Relaxed);
+
+            if new_raw != raw {
+                raw = new_raw;
+                true
+            } else {
+                false
+            }
+        }{}
+    }
+}
+
+impl<K: Hash + PartialEq, V> Display for AtomicCell<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let arc = unsafe {
+            &self.ptr.load(Ordering::Relaxed)
+        };
+        let vec = *&*arc;
+        write!(f, "ACell: arc=<{:?}>, vec=<{:?}>", arc, vec)
+    }
+}
+
+impl<K: Hash + PartialEq, V> Drop for AtomicCell<K, V> {
+    fn drop(&mut self) {
+        mem::drop(unsafe {&* self.ptr.load(Ordering::Relaxed)})
+    }
+}
 
 struct VersionTable<K, V> {
     head: AtomicUsize,
@@ -41,6 +142,7 @@ impl<K, V> VersionTable<K, V>
 
     fn scan<F>(&self, f: F) -> RwLockReadGuard<Bucket<K, V>>
         where
+
         F: Fn(&Bucket<K, V>) -> bool,
     {
         let start = self.current_head();
@@ -117,7 +219,11 @@ impl<K, V> VersionTable<K, V>
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for VersionTable<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "VersionTable {{ len: {} }}", self.bucket.len())
+        write!(f, "VersionTable {{ len: {} }}", self.bucket.len()).unwrap();
+        self.bucket.iter().for_each(|b| {
+            write!(f, "{:?}\n", *b).unwrap();
+        });
+        Ok(())
     }
 }
 
@@ -354,17 +460,15 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use std::iter;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
-    use self::crossbeam_utils::scoped::ScopedJoinHandle;
     use self::crossbeam_utils::scoped;
     use self::rand::distributions::Alphanumeric;
     use self::rand::Rng;
     use self::test::Bencher;
 
-    use super::Bucket;
-    use super::LoanMap;
-    use super::VersionTable;
+    use super::{AtomicCell, Bucket, LoanMap, VersionTable};
 
     /// Generates a random map with `set_size` elements and keys of size `key_size`
     fn gen_rand_map(set_size: usize, key_size: usize) -> (LoanMap<String, String>, Vec<String>) {
@@ -408,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_then_get() {
+    fn loan_map_insert_then_get() {
         let map: LoanMap<String, String> = LoanMap::new();
 
         let (key, value) = (String::from("i'm a key"), String::from("i'm a value"));
@@ -420,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_then_remove() {
+    fn loan_map_insert_then_remove() {
         let map: LoanMap<String, String> = LoanMap::new();
         let (key, value) = (String::from("key1"), String::from("value1"));
 
@@ -431,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn get_inexistent_value() {
+    fn loan_map_get_inexistent_value() {
         let map: LoanMap<String, String> = LoanMap::new();
 
         assert_eq!(map.get(&String::from("some key")), None);
@@ -460,100 +564,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn skewed_concurrent_puts() {
-        // TODO: modularize `concurrent_puts` for skewed key load
-    }
-
-    #[test]
-    fn concurrent_puts() {
-        const THREAD_NUM: i64 = 16;
-        const NUM_PUT: i64 = 8192 * 2 * 19;
-        const NUM_GET: i64 = NUM_PUT;
-
+    fn run_benchmark<P>(thread_count: usize, get_count: usize,
+                        put_count: usize, partition: P)
+        where P: Fn(usize) -> bool
+    {
         let mut rng = rand::thread_rng();
-        let keys: Vec<String> = (0..8192)
-            .map(|_| {
+        let (map, keys) = gen_rand_map(8192, 256);
+        let arc = Arc::new(map);
+        let indices: Vec<Vec<usize>> = (0..thread_count)
+            .map(|idx| {
+                let count = if partition(idx) {
+                    put_count
+                } else {
+                    get_count
+                };
+
                 iter::repeat(())
-                    .map(|()| rng.sample(Alphanumeric))
-                    .take(128)
-                    .collect::<String>()
+                    .take(count as usize)
+                    .map(|()| rng.gen_range::<usize>(0, keys.len()))
+                    .collect()
             })
             .collect();
-        let rand_key_set = |count: usize| {
-            let mut rng = rand::thread_rng();
-
-            (0..count).map(|_| keys[rng.gen_range(0, keys.len())].clone()).collect()
-        };
-
-        let map: Arc<LoanMap<String, u32>> = Arc::new(LoanMap::with_capacity(keys.len() * 2, 16));
-        let indices: Vec<Vec<String>> = (0..THREAD_NUM)
-            .map(|_| rand_key_set(NUM_PUT as usize))
-            .collect();
-
-        for i in &keys {
-            map.put(i.clone(), 0);
-        }
 
         scoped::scope(|s| {
-            let mut guards: Vec<ScopedJoinHandle<()>> = Vec::new();
+            for idx in 0..thread_count {
 
-            for i in 0..THREAD_NUM {
-                let map = map.clone();
-                let idx = i.clone();
-                let keys = indices[idx as usize].clone();
-                let mut filename = File::create(format!("{}.csv", idx).to_string()).unwrap();
+                let indice = indices[idx].clone();
+                let local_map = arc.clone();
+                let keys_copy: Vec<String> = indice.iter().map(|idx| {
+                    keys[*idx].clone()
+                }).collect();
+                let mut out = File::create(format!("{}.csv", idx)).unwrap();
+                let mut results = Vec::new();
 
-                if i % 2 == 0 {
-                    guards.push(s.spawn(move || {
-                        let mut rng = rand::thread_rng();
-                        let mut file = filename;
-                        let mut results: Vec<u32> = Vec::new();
-
-                        for i in 0..NUM_PUT {
-                            let key = keys[i as usize % keys.len()].clone();
-                            let mut start;
+                if partition(idx) {
+                    s.spawn(move || {
+                        for i in 0..put_count {
+                            let key = keys_copy[i].clone();
+                            let start = SystemTime::now();
 
                             {
-                                start = SystemTime::now();
-                                map.put(key, rng.gen::<u32>());
+                                local_map.put(key, String::from("value"));
                             }
 
                             results.push(start.elapsed().unwrap().subsec_nanos());
                         }
 
-                        for time in results {
-                            write!(file, "PUT;{}\n", time).unwrap();
-                        }
-                    }));
+                        results
+                            .iter()
+                            .for_each(|v| write!(out, "PUT;{}\n", v).unwrap());
+                    });
                 } else {
-                    guards.push(s.spawn(move || {
-                        let mut file = filename;
-                        let mut results: Vec<u32> = Vec::with_capacity(NUM_GET as usize);
-
-                        for i in 0..NUM_GET {
-                            let key = keys[i as usize % keys.len()].clone();
+                    s.spawn(move || {
+                        for i in 0..get_count {
+                            let key = &keys_copy[i];
                             let start = SystemTime::now();
 
                             {
-                                let _guard = map.get(&key).expect("missing key");
+                                let _lock = local_map.get(key);
+
                                 results.push(start.elapsed().unwrap().subsec_nanos());
-                                // Hold the lock for "network" sending
-                                thread::sleep(Duration::new(0, 500));
+                                // simulate waiting for the ACK
+                                thread::sleep(Duration::new(0, 5000));
                             }
                         }
 
-                        for time in results {
-                            write!(file, "GET;{}\n", time).unwrap();
-                        }
-                    }));
+                        results
+                            .iter()
+                            .for_each(|v| write!(out, "GET;{}\n", v).unwrap())
+                    });
                 }
             }
         });
     }
 
+    #[test]
+    fn loan_map_skewed_concurrent_puts() {
+        // TODO: modularize `concurrent_puts` for skewed key load
+    }
+
+    #[test]
+    fn loan_map_concurrent_puts() {
+        const THREAD_NUM: usize = 16;
+        const NUM_PUT: usize = 8192 * 2 * 19;
+        const NUM_GET: usize = NUM_PUT;
+
+        run_benchmark(THREAD_NUM, NUM_GET, NUM_PUT, |i| i % 2 == 0);
+    }
+
     #[bench]
-    fn bench_huge_values(b: &mut Bencher) {
+    fn loan_map_bench_huge_values(b: &mut Bencher) {
         let set_size = 512;
         let item_size = 4096;
         let values = gen_rand_strings(set_size, item_size);
@@ -573,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn double_insert_updates_value() {
+    fn loan_map_double_insert_updates_value() {
         let map: LoanMap<String, String> = LoanMap::new();
 
         let key = String::from("i'm a key");
@@ -589,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_value() {
+    fn loan_map_delete_value() {
         let map: LoanMap<String, String> = LoanMap::new();
         let key = String::from("key1");
         let value = String::from("value");
@@ -714,5 +814,33 @@ mod tests {
             let key = &keys[rng.gen::<usize>() % ssize];
             assert_eq!(map.get(key).is_some(), true);
         })
+    }
+
+    #[test]
+    fn atomic_cell_new() {
+        let cell: AtomicCell<String, String> = AtomicCell::new();
+
+        assert_eq!(false, true);
+    }
+
+    #[test]
+    fn atomic_cell_push() {
+        let cell = AtomicCell::new();
+        let bucket = Arc::new(Bucket::Contains(String::from("key"), String::from("value")));
+        let raw = cell.ptr.load(Ordering::Relaxed);
+
+        assert_eq!(unsafe { &*raw }.len(), 0);
+
+        cell.put(String::from("key"), String::from("value"));
+
+        assert_eq!(unsafe { &*cell.ptr.load(Ordering::Relaxed)}.len(), 1);
+        assert_eq!(cell.get(bucket.key().unwrap()).unwrap(), bucket);
+    }
+
+    #[test]
+    fn atomic_cell_get_empty() {
+        let cell: AtomicCell<String, String> = AtomicCell::new();
+
+        assert_eq!(cell.get(&String::from("key")), None);
     }
 }
