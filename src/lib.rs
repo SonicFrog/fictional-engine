@@ -1,118 +1,157 @@
-#![feature(allocator_api)]
 #![feature(test)]
 #![feature(box_syntax)]
 extern crate owning_ref;
+extern crate abox;
 
 use std::collections::hash_map::RandomState;
 use std::fmt;
-use std::fmt::Display;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::heap::{Heap, Alloc, Layout};
 use std::mem;
-use std::ptr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, AtomicPtr, Ordering};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::ops::Deref;
 use std::vec::Vec;
 
+use self::abox::AtomicBox;
 use self::owning_ref::{OwningHandle, OwningRef};
 
 const DEFAULT_TABLE_CAPACITY: usize = 128;
 const DEFAULT_BUCKET_CAPACITY: usize = 128;
 
-struct AtomicCell<K, V>
-    where K: PartialEq + Hash,
+/// A concurrent HashMap that uses optimistic concurrency control
+/// (hence the name)
+pub struct OptiMap<K, V, S>
+    where
+    K: PartialEq + Hash,
+    S: BuildHasher,
 {
-    ptr: AtomicPtr<Arc<Vec<Arc<Bucket<K, V>>>>>,
+    table: AtomicTable<K, V, S>,
 }
 
-impl<K, V> AtomicCell<K, V>
+impl<K, V> OptiMap<K, V, RandomState>
     where K: PartialEq + Hash,
 {
-    fn new() -> AtomicCell<K, V> {
-        let copy_from = Arc::new(Vec::new());
-        let ptr = unsafe { AtomicCell::make_vec(copy_from) };
-
-        AtomicCell {
-                ptr: AtomicPtr::new(ptr),
+    pub fn new() -> Self {
+        OptiMap {
+            table: AtomicTable::new(),
         }
     }
 
-    unsafe fn make_vec(content: Arc<Vec<Arc<Bucket<K, V>>>>) -> *mut Arc<Vec<Arc<Bucket<K, V>>>> {
-
-        let ptr =
-            Heap.alloc(Layout::new::<Arc<Vec<Arc<Bucket<K, V>>>>>()).unwrap()
-            as *mut Arc<Vec<Arc<Bucket<K, V>>>>;
-
-        ptr::copy_nonoverlapping(&content as *const Arc<Vec<Arc<Bucket<K, V>>>>,
-                                 ptr, 1);
-        mem::forget(content);
-        ptr
+    pub fn with_capacity(cap: usize) -> Self {
+        OptiMap::with_capacity_and_hasher(cap, RandomState::new())
     }
+}
 
-    fn scan<F>(&self, matches: F) -> Option<Arc<Bucket<K, V>>>
-        where F: Fn(&Bucket<K, V>) -> bool,
-    {
-        let ptr = self.ptr.load(Ordering::Relaxed);
-
-        for item in unsafe { &*ptr }.iter() {
-            if matches(&item) {
-                return Some(item.clone());
-            }
+impl<K, V, S> OptiMap<K, V, S>
+    where K: PartialEq + Hash,
+          S: BuildHasher,
+{
+    pub fn with_hasher(hasher: S) -> Self {
+        OptiMap {
+            table: AtomicTable::with_hasher(hasher),
         }
-
-        None
     }
 
-    fn get(&self, key: &K) -> Option<Arc<Bucket<K, V>>> {
-        self.scan(|x| x.key_matches(key))
+    pub fn with_capacity_and_hasher(cap: usize, hasher: S) -> Self {
+        OptiMap {
+            table: AtomicTable::with_capacity_and_hasher(cap, hasher),
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<ValueHolder<K, V>> {
+        self.table.get(key).map(|x| ValueHolder { bucket: Arc::clone(&x) })
+    }
+
+    pub fn put(&self, key: K, value: V) {
+        self.table.put(key, value)
+    }
+
+    pub fn delete(&self, key: &K) {
+        self.table.delete(key)
+    }
+}
+
+#[derive(Debug)]
+/// A struct used to hold the bucket for as long as the value is needed
+pub struct ValueHolder<K, V> {
+    bucket: Arc<Bucket<K, V>>
+}
+
+impl<K, V> Deref for ValueHolder<K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        self.bucket.value_ref().unwrap()
+    }
+}
+
+impl<K: PartialEq, V: PartialEq> PartialEq for ValueHolder<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+struct AtomicVersionTable<K, V> {
+    value: AtomicBox<Vec<Arc<Bucket<K, V>>>>,
+}
+
+impl<K: PartialEq, V> AtomicVersionTable<K, V> {
+    fn new() -> AtomicVersionTable<K, V> {
+        AtomicVersionTable {
+            value: AtomicBox::new(Vec::new()),
+        }
     }
 
     fn put(&self, key: K, value: V) {
         let bucket = Arc::new(Bucket::Contains(key, value));
-        let mut raw = self.ptr.load(Ordering::Relaxed);
 
-        while {
-            let ptr: Arc<Vec<Arc<Bucket<K, V>>>> = unsafe { &*raw }.clone();
-            let mut list: Arc<Vec<Arc<Bucket<K, V>>>> = Arc::new(Vec::new());
+        self.value.replace_with(move |x| {
+            let mut y = x.clone();
 
-            assert_eq!(ptr.len() < 10, true);
 
-            for i in ptr.iter() {
-
+            for i in 0..y.len() {
+                if y[i].key_matches(bucket.key().unwrap()) {
+                    y[i] = bucket.clone();
+                }
             }
 
-            {
-                Arc::get_mut(&mut list).unwrap().insert(0, bucket.clone());
+            y.push(bucket.clone());
+            y
+        });
+    }
+
+    fn delete(&self, key: &K) {
+        self.value.replace_with(move |x| {
+            let mut y = x.clone();
+
+            for i in 0..y.len() {
+                if y[i].key_matches(key) {
+                    y.remove(i);
+                    break;
+                }
             }
 
-            let new_raw = self.ptr.compare_and_swap(raw, &mut list as *mut Arc<_>,
-                                                    Ordering::Relaxed);
+            y
+        })
+    }
 
-            if new_raw != raw {
-                raw = new_raw;
-                true
-            } else {
-                false
-            }
-        }{}
+    fn get(&self, key: &K) -> Option<Arc<Bucket<K, V>>> {
+        self.find(|x| x.key_matches(key))
+    }
+
+    #[inline]
+    fn find<F>(&self, f: F) -> Option<Arc<Bucket<K, V>>>
+        where F: Fn(&Arc<Bucket<K, V>>) -> bool
+    {
+        self.value.iter().cloned().find(f)
     }
 }
 
-impl<K: Hash + PartialEq, V> Display for AtomicCell<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let arc = unsafe {
-            &self.ptr.load(Ordering::Relaxed)
-        };
-        let vec = *&*arc;
-        write!(f, "ACell: arc=<{:?}>, vec=<{:?}>", arc, vec)
-    }
-}
-
-impl<K: Hash + PartialEq, V> Drop for AtomicCell<K, V> {
-    fn drop(&mut self) {
-        mem::drop(unsafe {&* self.ptr.load(Ordering::Relaxed)})
+impl<K, V> Clone for AtomicVersionTable<K, V> {
+    fn clone(&self) -> Self {
+        AtomicVersionTable {
+            value: self.value.clone(),
+        }
     }
 }
 
@@ -348,6 +387,79 @@ impl<K, V> Table<K, V>
     }
 }
 
+struct AtomicTable<K, V, S>
+    where
+    K: PartialEq + Hash,
+    S: BuildHasher,
+{
+    buckets: Vec<AtomicVersionTable<K, V>>,
+    hash_builder: S,
+}
+
+const DEFAULT_BUCKET_NUMBER: usize = 128;
+
+impl<K, V> AtomicTable<K, V, RandomState>
+    where
+    K: PartialEq + Hash,
+{
+
+    fn new() -> AtomicTable<K, V, RandomState> {
+        AtomicTable::with_capacity(DEFAULT_BUCKET_NUMBER)
+    }
+
+    /// Instantiate a new AtomicTable with `cap` buckets
+    fn with_capacity(cap: usize) -> AtomicTable<K, V, RandomState> {
+        AtomicTable::with_capacity_and_hasher(cap, RandomState::new())
+    }
+}
+
+impl<K, V, S> AtomicTable<K, V, S>
+    where
+    K: PartialEq + Hash,
+    S: BuildHasher,
+{
+    fn with_hasher(hasher: S) -> AtomicTable<K, V, S> {
+        AtomicTable::with_capacity_and_hasher(DEFAULT_BUCKET_NUMBER, hasher)
+    }
+
+    fn with_capacity_and_hasher(cap: usize, hasher: S) -> AtomicTable<K, V, S> {
+        AtomicTable {
+            buckets: (0..cap).map(|_| AtomicVersionTable::new()).collect(),
+            hash_builder: hasher,
+        }
+    }
+
+    fn hash(&self, key: &K) -> usize {
+        let mut hasher = self.hash_builder.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish() as usize % self.buckets.len()
+    }
+
+    #[inline]
+    fn find_bucket(&self, key: &K) -> AtomicVersionTable<K, V>  {
+        self.buckets[self.hash(key)].clone()
+    }
+
+    #[inline]
+    fn scan<F>(&self, key: &K, matches: F) -> Option<Arc<Bucket<K, V>>>
+        where F: Fn(&Arc<Bucket<K, V>>) -> bool,
+    {
+        self.find_bucket(key).find(matches)
+    }
+
+    fn put(&self, key: K, value: V) {
+        self.find_bucket(&key).put(key, value);
+    }
+
+    fn delete(&self, key: &K) {
+        self.find_bucket(key).delete(key);
+    }
+
+    fn get(&self, key: &K) -> Option<Arc<Bucket<K, V>>> {
+        self.scan(key, |x| x.key_matches(key))
+    }
+}
+
 pub struct ReadGuard<'a, K: 'a + PartialEq + Hash, V: 'a> {
     inner: OwningRef<
             OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockReadGuard<'a, Bucket<K, V>>>,
@@ -455,12 +567,12 @@ mod tests {
     extern crate rand;
     extern crate test;
 
+    use std::collections::hash_map::RandomState;
     use std::fs::File;
     use std::io::Write;
     use std::time::{Duration, SystemTime};
     use std::iter;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use std::thread;
 
     use self::crossbeam_utils::scoped;
@@ -468,7 +580,8 @@ mod tests {
     use self::rand::Rng;
     use self::test::Bencher;
 
-    use super::{AtomicCell, Bucket, LoanMap, VersionTable};
+    use super::{AtomicVersionTable, AtomicTable, OptiMap};
+    use super::{Bucket, LoanMap, VersionTable};
 
     /// Generates a random map with `set_size` elements and keys of size `key_size`
     fn gen_rand_map(set_size: usize, key_size: usize) -> (LoanMap<String, String>, Vec<String>) {
@@ -817,30 +930,150 @@ mod tests {
     }
 
     #[test]
-    fn atomic_cell_new() {
-        let cell: AtomicCell<String, String> = AtomicCell::new();
+    fn atomic_version_table_insert_then_get() {
+        let table: AtomicVersionTable<String, u32> = AtomicVersionTable::new();
+        let key = String::from("keyt");
+        let value = 1023;
 
-        assert_eq!(false, true);
+        table.put(key.clone(), value.clone());
+        let bucket = table.get(&key).expect("failed to insert value");
+
+        assert_eq!(bucket.key_matches(&key), true);
+        assert_eq!(bucket.value_ref(), Ok(&value));
     }
 
     #[test]
-    fn atomic_cell_push() {
-        let cell = AtomicCell::new();
-        let bucket = Arc::new(Bucket::Contains(String::from("key"), String::from("value")));
-        let raw = cell.ptr.load(Ordering::Relaxed);
+    fn atomic_table_put_then_get() {
+        let table = AtomicTable::with_capacity(128);
+        let key = String::from("key1");
+        let value = String::from("value1");
 
-        assert_eq!(unsafe { &*raw }.len(), 0);
+        table.put(key.clone(), value.clone());
 
-        cell.put(String::from("key"), String::from("value"));
+        let out = table.get(&key).expect("value was not inserted");
 
-        assert_eq!(unsafe { &*cell.ptr.load(Ordering::Relaxed)}.len(), 1);
-        assert_eq!(cell.get(bucket.key().unwrap()).unwrap(), bucket);
+        assert_eq!(out.key_matches(&key), true);
+        assert_eq!(out.value_ref(), Ok(&value));
     }
 
     #[test]
-    fn atomic_cell_get_empty() {
-        let cell: AtomicCell<String, String> = AtomicCell::new();
+    fn atomic_table_overwrite_value() {
+        let table = AtomicTable::new();
+        let key = String::from("key1");
+        let (v1, v2) = (String::from("some value"), String::from("another value"));
 
-        assert_eq!(cell.get(&String::from("key")), None);
+        table.put(key.clone(), v1.clone());
+        table.put(key.clone(), v2.clone());
+
+        let bucket = table.get(&key).expect("value was not inserted");
+
+        assert_eq!(bucket.key_matches(&key), true);
+        assert_eq!(bucket.value_ref(), Ok(&v2));
+    }
+
+    #[test]
+    fn atomic_table_remove() {
+        let table = AtomicTable::new();
+        let key = String::from("key1");
+        let value = String::from("v2");
+
+        table.put(key.clone(), value);
+
+        table.delete(&key);
+
+        assert_eq!(table.get(&key), None);
+    }
+
+    #[test]
+    fn optimap_empty() {
+        let map: OptiMap<String, String, RandomState> = OptiMap::new();
+
+        assert_eq!(map.get(&String::from("key")), None);
+    }
+
+    #[test]
+    fn optimap_put_then_get() {
+        let map = OptiMap::new();
+        let key = String::from("k");
+        let value = String::from("v");
+
+        map.put(key.clone(), value.clone());
+
+        let v = map.get(&key).expect("failed to insert value");
+
+        assert_eq!(*v, value);
+    }
+
+    #[bench]
+    fn optimap_bench_access_str_key_str_value(b: &mut Bencher) {
+        let value_count = 8192;
+        let key_size = 128;
+        let value_size = 1024;
+        let map = OptiMap::with_capacity(2 * value_count);
+        let kvs: Vec<(String, String)> = gen_rand_strings(value_count, key_size)
+            .iter().cloned()
+            .zip(
+                gen_rand_strings(value_count, value_size)
+                    .iter()
+                    .cloned())
+            .collect();
+
+        for (key, value) in &kvs {
+            map.put(key.clone(), value.clone());
+        }
+
+        let mut rng = rand::thread_rng();
+
+        b.iter(move || {
+            let idx = rng.gen::<usize>() % &kvs.len();
+            let vh = map.get(&kvs[idx].0).expect("value was not inserted");
+
+            assert_eq!(*vh, kvs[idx].1);
+        })
+    }
+
+    #[bench]
+    fn optimap_bench_put_str(b: &mut Bencher) {
+        let value_count = 8192;
+        let key_size = 128;
+        let value_size = 1024;
+        let map = OptiMap::with_capacity(2 * value_count);
+        let kvs: Vec<(String, String)> = gen_rand_strings(value_count, key_size)
+            .iter().cloned()
+            .zip(
+                gen_rand_strings(value_count, value_size)
+                    .iter()
+                    .cloned())
+            .collect();
+        let mut rng = rand::thread_rng();
+
+        b.iter(move || {
+            let (key, value) = kvs[rng.gen::<usize>() % kvs.len()].clone();
+            map.put(key, value);
+        })
+    }
+
+    #[bench]
+    fn optimap_bench_put_u64(b: &mut Bencher) {
+        let value_count = 8192;
+        let map = OptiMap::with_capacity(2 * value_count);
+        let mut rng = rand::thread_rng();
+
+        let keys: Vec<u64> = (0..value_count)
+            .map(|_| rng.gen::<u64>())
+            .collect();
+        let values: Vec<u64> = (0..value_count)
+            .map(|_| rng.gen::<u64>())
+            .collect();
+
+        let kvs: Vec<(u64, u64)> = keys.iter().cloned()
+            .zip(values.iter().cloned()).collect();
+
+        let mut i = 0;
+
+        b.iter(move || {
+            map.put(kvs[i].0, kvs[i].1);
+            i = (i + 1) % kvs.len();
+        })
     }
 }
