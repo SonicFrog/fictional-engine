@@ -71,6 +71,11 @@ impl<K, V, S> OptiMap<K, V, S>
     }
 }
 
+struct StatCollector {
+    full_search: AtomicUsize,
+    closure_run: AtomicUsize,
+}
+
 #[derive(Debug)]
 /// A struct used to hold the bucket for as long as the value is needed
 pub struct ValueHolder<K, V> {
@@ -113,6 +118,7 @@ impl<K: PartialEq, V> AtomicVersionTable<K, V> {
             for i in 0..y.len() {
                 if y[i].key_matches(bucket.key().unwrap()) {
                     y[i] = bucket.clone();
+                    return y;
                 }
             }
 
@@ -180,25 +186,6 @@ impl<K, V> VersionTable<K, V>
 
     fn next_head(&self) -> usize {
         self.head.fetch_add(1, Ordering::Relaxed) % self.bucket.len()
-    }
-
-    fn scan<F>(&self, f: F) -> RwLockReadGuard<Bucket<K, V>>
-        where
-
-        F: Fn(&Bucket<K, V>) -> bool,
-    {
-        let start = self.current_head();
-
-        for i in 0..self.bucket.len() {
-            let idx = (i + start) % self.bucket.len();
-            let bucket = self.bucket[idx].read().unwrap();
-
-            if f(&bucket) {
-                return bucket;
-            }
-        }
-
-        self.bucket[start].read().unwrap()
     }
 
     fn rev_scan<F>(&self, f: F) -> RwLockReadGuard<Bucket<K, V>>
@@ -277,13 +264,6 @@ enum Bucket<K, V> {
 }
 
 impl<K, V> Bucket<K, V> {
-    fn is_free(&self) -> bool {
-        match *self {
-            Bucket::Empty | Bucket::Removed(_) => true,
-            _ => false,
-        }
-    }
-
     fn value(self) -> Option<V> {
         if let Bucket::Contains(_, v) = self {
             Some(v)
@@ -345,14 +325,6 @@ impl<K, V> Table<K, V>
         let mut hasher = self.hash_builder.build_hasher();
         key.hash(&mut hasher);
         hasher.finish() as usize % self.buckets.len()
-    }
-
-    #[inline]
-    fn scan<F>(&self, key: &K, matches: F) -> RwLockReadGuard<Bucket<K, V>>
-        where
-        F: Fn(&Bucket<K, V>) -> bool,
-    {
-        self.buckets[self.hash(key)].scan(matches)
     }
 
     #[inline]
@@ -1091,7 +1063,7 @@ mod tests {
 
         // test parameters
         let put_count: usize = 1000000;
-        let get_count: usize = 19 * 1000000;
+        let get_count: usize = 1000000;
         let pg_selector = |x| x % 2 == 0;
 
         let kvs: Vec<(u64, u64)> = (0..value_count)
