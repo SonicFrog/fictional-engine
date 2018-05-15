@@ -81,7 +81,7 @@ impl<K, V> Deref for ValueHolder<K, V> {
     type Target = V;
 
     fn deref(&self) -> &Self::Target {
-        self.bucket.value_ref().unwrap()
+        self.bucket.value_ref().expect("ValueHolder must be given a Bucket::Contains")
     }
 }
 
@@ -102,6 +102,7 @@ impl<K: PartialEq, V> AtomicVersionTable<K, V> {
         }
     }
 
+    #[inline]
     fn put(&self, key: K, value: V) {
         let bucket = Arc::new(Bucket::Contains(key, value));
 
@@ -120,6 +121,7 @@ impl<K: PartialEq, V> AtomicVersionTable<K, V> {
         });
     }
 
+    #[inline]
     fn delete(&self, key: &K) {
         self.value.replace_with(move |x| {
             let mut y = x.clone();
@@ -135,6 +137,7 @@ impl<K: PartialEq, V> AtomicVersionTable<K, V> {
         })
     }
 
+    #[inline]
     fn get(&self, key: &K) -> Option<Arc<Bucket<K, V>>> {
         self.find(|x| x.key_matches(key))
     }
@@ -563,6 +566,7 @@ impl<K, V> LoanMap<K, V>
 
 #[cfg(test)]
 mod tests {
+    extern crate core_affinity;
     extern crate crossbeam_utils;
     extern crate rand;
     extern crate test;
@@ -573,6 +577,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use std::iter;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     use self::crossbeam_utils::scoped;
@@ -1075,5 +1080,85 @@ mod tests {
             map.put(kvs[i].0, kvs[i].1);
             i = (i + 1) % kvs.len();
         })
+    }
+
+    #[test]
+    // TODO: improve this by balancing puts and gets across cores
+    fn optimap_core_affinity_u128_bench() {
+        let value_count = 8192;
+        let map = Arc::new(OptiMap::with_capacity(value_count * 4));
+        let mut rng = rand::thread_rng();
+
+        // test parameters
+        let put_count: usize = 1000000;
+        let get_count: usize = 19 * 1000000;
+        let pg_selector = |x| x % 2 == 0;
+
+        let kvs: Vec<(u64, u64)> = (0..value_count)
+            .map(|_| (rng.gen::<u64>(), rng.gen::<u64>()))
+            .collect();
+
+        kvs.iter().cloned().for_each(|(k, v)| map.put(k, v));
+        let tid = Arc::new(AtomicUsize::new(0));
+        let core_ids = core_affinity::get_core_ids().unwrap();
+
+        let handles = core_ids.into_iter()
+            .skip(1) // leave one core for OS to do some bookkeeping
+            .map(|id| {
+                let tid = tid.clone();
+                let kvs = kvs.clone();
+                let map = Arc::clone(&map);
+
+                thread::spawn(move || {
+                    core_affinity::set_for_current(id);
+                    let id = (&tid).fetch_add(1, Ordering::Relaxed);
+                    let filename = format!("{}.csv", id);
+                    let mut file = File::create(filename).unwrap();
+                    let mut rng = rand::thread_rng();
+                    let mut results = Vec::with_capacity(put_count);
+
+                    if pg_selector(id) {
+                        for i in 0..put_count {
+                            let idx = rng.gen::<usize>() % kvs.len();
+                            let kv = kvs[idx].clone();
+                            let start = SystemTime::now();
+
+                            {
+                                map.put(kv.0, kv.1);
+                            }
+
+                            let elapsed = start.elapsed().unwrap().subsec_nanos();
+
+                            results.push(elapsed);
+                        }
+
+                        for result in results {
+                            write!(file, "PUT;{}\n", result).unwrap();
+                        }
+                    } else {
+                        for i in 0..get_count {
+                            let idx = rng.gen::<usize>() % kvs.len();
+                            let kv = kvs[idx].clone();
+                            let start = SystemTime::now();
+                            let mut elapsed;
+
+                            {
+                                let _lock = map.get(&kv.0);
+
+                                elapsed = start.elapsed().unwrap().subsec_nanos();
+                            }
+
+                            results.push(elapsed);
+                        }
+
+                        for result in results {
+                            write!(file, "GET;{}\n", result).unwrap();
+                        }
+                    }
+
+                })
+            }).collect::<Vec<_>>();
+
+        handles.into_iter().for_each(|h| h.join().unwrap());
     }
 }
