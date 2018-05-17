@@ -9,9 +9,6 @@ use std::vec::Vec;
 
 use self::abox::AtomicBox;
 
-const DEFAULT_TABLE_CAPACITY: usize = 128;
-const DEFAULT_BUCKET_CAPACITY: usize = 128;
-
 /// A concurrent HashMap that uses optimistic concurrency control
 /// (hence the name)
 pub struct OptiMap<K, V, S>
@@ -115,7 +112,6 @@ impl<K: PartialEq, V> AtomicVersionTable<K, V> {
         self.value.replace_with(move |x| {
             let mut y = x.clone();
 
-
             for i in 0..y.len() {
                 if y[i].key_matches(bucket.key()) {
                     y[i] = bucket.clone();
@@ -165,8 +161,6 @@ impl<K, V> Clone for AtomicVersionTable<K, V> {
         }
     }
 }
-
-
 
 struct AtomicTable<K, V, S>
     where
@@ -283,13 +277,17 @@ pub mod tests {
     extern crate test;
 
     use std::collections::hash_map::RandomState;
+    use std::fmt;
     use std::fs::File;
+    use std::hash::{BuildHasher, Hash};
     use std::io::Write;
+    use std::marker::PhantomData;
     use std::time::SystemTime;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
+    use self::crossbeam_utils::scoped;
     use self::rand::Rng;
     use self::test::Bencher;
 
@@ -445,83 +443,140 @@ pub mod tests {
         })
     }
 
+    enum Task<K, V> {
+        Put(K, V),
+        Get(K),
+        Remove(K),
+    }
+
+    impl<K, V> fmt::Display for Task<K, V> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            let val = match self {
+                Task::Put(_, _) => "PUT",
+                Task::Get(_) => "GET",
+                Task::Remove(_) => "DEL",
+            };
+
+            write!(f, "{}", val)
+        }
+    }
+
+    impl<K: Clone, V: Clone> Clone for Task<K, V> {
+        fn clone(&self) -> Task<K, V> {
+            match self {
+                Task::Put(key, value) => Task::Put(key.clone(), value.clone()),
+                Task::Get(ref key) => Task::Get(key.clone()),
+                Task::Remove(ref key) => Task::Remove(key.clone()),
+            }
+        }
+    }
+
+    struct BenchRunner<K, V> {
+        p_k: PhantomData<K>,
+        p_v: PhantomData<V>,
+    }
+
+    impl<K, V> BenchRunner<K, V>
+        where K: Clone + Hash + PartialEq + Send + Sync,
+              V: Clone + Send + Sync,
+    {
+        #[inline]
+        fn execute_timed(map: &OptiMap<K, V, RandomState>, task: Task<K, V>) -> u32 {
+            let start = SystemTime::now();
+
+            BenchRunner::execute(map, task);
+
+            start.elapsed().unwrap().subsec_nanos()
+        }
+
+        #[inline]
+        fn execute(map: &OptiMap<K, V, RandomState>, task: Task<K, V>) {
+            match task {
+                Task::Put(key, value) => map.put(key, value),
+                Task::Get(key) => {map.get(&key);},
+                Task::Remove(key) => map.delete(&key),
+            };
+        }
+
+        fn run_benchmark(name: &str, buckets: usize, workload: Vec<Arc<Vec<Task<K, V>>>>,
+                         initial: Vec<Task<K, V>>) {
+            let map = Arc::new(OptiMap::with_capacity(buckets));
+            let core_ids = core_affinity::get_core_ids().unwrap();
+            let results: Arc<RwLock<Vec<Vec<_>>>> = Arc::new(RwLock::new(Vec::new()));
+
+            // build initial map
+            initial.iter().cloned().for_each(|t| BenchRunner::execute(&map, t));
+
+            scoped::scope(|ctx| {
+                let results = Arc::clone(&results);
+                let rd = Arc::clone(&results);
+
+                core_ids.into_iter().zip(workload.iter().cloned())
+                    .skip(1)
+                    .map(|(id, work)| {
+                        core_affinity::set_for_current(id);
+                        let results = Arc::clone(&results);
+                        let map = Arc::clone(&map);
+                        let work = work.clone();
+
+                        ctx.spawn(move || {
+                            let times = work
+                                .iter()
+                                .cloned()
+                                .map(|t| (t.clone(), BenchRunner::execute_timed(&*map, t)))
+                                .collect();
+                            results.write().unwrap().push(times);
+                        })
+                    }).for_each(drop);
+
+                let mut file = File::create(name).unwrap();
+
+                rd.read().unwrap().iter()
+                    .for_each(|res| {
+                        res.iter().for_each(|(t, duration)| {
+                            write!(file, "{};{}\n", t, duration).unwrap();
+                        })
+                    });
+            });
+        }
+    }
+
     #[test]
     // TODO: improve this by balancing puts and gets across cores
-    fn optimap_core_affinity_u128_bench() {
-        let value_count = 8192;
-        let map = Arc::new(OptiMap::with_capacity(value_count * 4));
+    fn optimap_2x_collision_benchmark() {
         let mut rng = rand::thread_rng();
 
         // test parameters
-        let put_count: usize = 1000000;
-        let get_count: usize = 1000000;
-        let pg_selector = |x| x % 2 == 0;
+        let value_count = 8192;
+        let key_size = 128;
+        let bucket_count = value_count / 2;
+        let put_count: usize = 500000;
+        let get_count: usize = 500000;
+        let del_count: usize = 50000;
 
-        let kvs: Vec<(u64, u64)> = (0..value_count)
-            .map(|_| (rng.gen::<u64>(), rng.gen::<u64>()))
-            .collect();
+        let keys = gen_rand_strings(value_count, key_size);
 
-        kvs.iter().cloned().for_each(|(k, v)| map.put(k, v));
-        let tid = Arc::new(AtomicUsize::new(0));
-        let core_ids = core_affinity::get_core_ids().unwrap();
+        let init = keys.iter()
+            .map(|k| Task::Put(k.clone(), rng.gen::<u64>()))
+            .collect::<Vec<_>>();
 
-        let handles = core_ids.into_iter()
-            .skip(1) // leave one core for OS to do some bookkeeping
-            .map(|id| {
-                let tid = tid.clone();
-                let kvs = kvs.clone();
-                let map = Arc::clone(&map);
+        let workloads = core_affinity::get_core_ids().unwrap().into_iter()
+            .map(|_| {
+                let tasks = (0..(put_count + get_count + del_count)).map(|i| {
+                    let key = keys[rng.gen::<usize>() % keys.len()].clone();
 
-                thread::spawn(move || {
-                    core_affinity::set_for_current(id);
-                    let id = (&tid).fetch_add(1, Ordering::Relaxed);
-                    let filename = format!("{}.csv", id);
-                    let mut file = File::create(filename).unwrap();
-                    let mut rng = rand::thread_rng();
-                    let mut results = Vec::with_capacity(put_count);
-
-                    if pg_selector(id) {
-                        for i in 0..put_count {
-                            let idx = rng.gen::<usize>() % kvs.len();
-                            let kv = kvs[idx].clone();
-                            let start = SystemTime::now();
-
-                            {
-                                map.put(kv.0, kv.1);
-                            }
-
-                            let elapsed = start.elapsed().unwrap().subsec_nanos();
-
-                            results.push(elapsed);
-                        }
-
-                        for result in results {
-                            write!(file, "PUT;{}\n", result).unwrap();
-                        }
+                    if i < put_count {
+                        Task::Get(key)
+                    } else if i < put_count + get_count {
+                        Task::Put(key, rng.gen::<u64>())
                     } else {
-                        for i in 0..get_count {
-                            let idx = rng.gen::<usize>() % kvs.len();
-                            let kv = kvs[idx].clone();
-                            let start = SystemTime::now();
-                            let mut elapsed;
-
-                            {
-                                let _lock = map.get(&kv.0);
-
-                                elapsed = start.elapsed().unwrap().subsec_nanos();
-                            }
-
-                            results.push(elapsed);
-                        }
-
-                        for result in results {
-                            write!(file, "GET;{}\n", result).unwrap();
-                        }
+                        Task::Remove(key)
                     }
+                }).collect();
 
-                })
-            }).collect::<Vec<_>>();
+                Arc::new(tasks)
+            }).collect::<Vec<Arc<_>>>();
 
-        handles.into_iter().for_each(|h| h.join().unwrap());
+        BenchRunner::run_benchmark("128_5MG.5MP.5KD", bucket_count, workloads, init);
     }
 }
