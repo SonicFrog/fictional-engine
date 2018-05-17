@@ -9,6 +9,9 @@ matrix:
     - rust: beta
     - rust: stable
 
+before_install:
+  - sudo apt-get -qq update
+
 after_success: |
   sudo apt-get install libcurl4-openssl-dev libelf-dev libdw-dev &&
   wget https://github.com/SimonKagstrom/kcov/archive/master.tar.gz &&
