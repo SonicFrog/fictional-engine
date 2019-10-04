@@ -2,7 +2,7 @@ extern crate abox;
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::atomic::AtomicUsize;
+use std::mem;
 use std::sync::Arc;
 use std::ops::Deref;
 use std::vec::Vec;
@@ -54,24 +54,28 @@ impl<K, V, S> OptiMap<K, V, S>
     }
 
     /// Gets the value associated with the given key if it exists
+    #[inline]
     pub fn get(&self, key: &K) -> Option<ValueHolder<K, V>> {
         self.table.get(key).map(|x| ValueHolder { bucket: Arc::clone(&x) })
     }
 
+    /// Checks if the map contains a given key
+    #[inline]
+    pub fn contains(&self, key: &K) -> bool {
+        self.table.get(key).map_or(false, |_| true)
+    }
+
     /// Insert a new entry in the `OptiMap`.
     /// Note that the map takes ownership of both the key and the value
+    #[inline]
     pub fn put(&self, key: K, value: V) {
         self.table.put(key, value)
     }
 
+    #[inline]
     pub fn delete(&self, key: &K) {
         self.table.delete(key)
     }
-}
-
-struct StatCollector {
-    full_search: AtomicUsize,
-    tx_fail: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -114,8 +118,8 @@ impl<K: PartialEq, V> AtomicVersionTable<K, V> {
 
             for i in 0..y.len() {
                 if y[i].key_matches(bucket.key()) {
-                    y[i] = bucket.clone();
-                    return y;
+                    mem::drop(y.swap_remove(i));
+                    break;
                 }
             }
 
@@ -208,12 +212,10 @@ impl<K, V, S> AtomicTable<K, V, S>
         hasher.finish() as usize % self.buckets.len()
     }
 
-    #[inline]
     fn find_bucket(&self, key: &K) -> AtomicVersionTable<K, V>  {
         self.buckets[self.hash(key)].clone()
     }
 
-    #[inline]
     fn scan<F>(&self, key: &K, matches: F) -> Option<Arc<BucketEntry<K, V>>>
         where F: Fn(&Arc<BucketEntry<K, V>>) -> bool,
     {
@@ -582,9 +584,9 @@ pub mod tests {
         let key_count = 8192;
         let esize = 1024;
         let keys = gen_rand_strings(key_count, esize);
-        let put_count = 500000;
-        let get_count = 1000000;
-        let del_count = 5000;
+        let put_count = 100000;
+        let get_count = 900000;
+        let del_count = 0;
 
         let mut rng = rand::thread_rng();
         let init = keys.iter().cloned().map(|k| Task::Put(k, rng.gen::<u64>())).collect();
@@ -592,6 +594,22 @@ pub mod tests {
 
         BenchRunner::run_benchmark("read_heavy.csv", key_count, workloads, init);
     }
+
+    #[test]
+    fn optimap_read_heavy_collision_benchmark() {
+        let key_count = 8192 / 4;
+        let esize = 1024;
+        let keys = gen_rand_strings(key_count, esize);
+        let put_count = 100000;
+        let get_count = 900000;
+        let del_count = 0;
+
+        let mut rng = rand::thread_rng();
+        let init = keys.iter().cloned().map(|k| Task::Put(k, rng.gen::<u64>())).collect();
+        let workloads = gen_workload::<String, u64>(keys, put_count, get_count, del_count);
+
+        BenchRunner::run_benchmark("read_heavy_collision.csv", key_count, workloads, init);
+        }
 
     #[test]
     fn optimap_no_collision_benchmark() {

@@ -7,9 +7,9 @@ use std::sync::atomic::AtomicUsize;
 use std::mem;
 use std::sync::atomic::{Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
-use self::owning_ref::{OwningHandle, OwningRef};
+use self::owning_ref::{OwningHandle, OwningRefMut, OwningRef};
 
 const DEFAULT_BUCKET_CAPACITY: usize = 16;
 const DEFAULT_TABLE_CAPACITY: usize = 128;
@@ -19,6 +19,33 @@ pub struct ReadGuard<'a, K: 'a + PartialEq + Hash, V: 'a> {
             OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockReadGuard<'a, Bucket<K, V>>>,
         V,
         >,
+}
+
+pub struct WriteGuard<'a, K: 'a + PartialEq + Hash, V: 'a> {
+    inner: OwningRefMut<
+            OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockWriteGuard<'a, Bucket<K, V>>>,
+        V,
+        >,
+}
+
+impl<'a, K, V> Deref for WriteGuard<'a, K, V>
+where
+    K: PartialEq + Hash,
+{
+    type Target = V;
+
+    fn deref(&self) -> &V {
+        &*self.inner
+    }
+}
+
+impl<'a, K, V> DerefMut for WriteGuard<'a, K, V>
+where
+    K: PartialEq + Hash,
+{
+    fn deref_mut(&mut self) -> &mut V {
+        &mut *self.inner
+    }
 }
 
 impl<'a, K: Hash + PartialEq, V: fmt::Display> fmt::Debug for ReadGuard<'a, K, V> {
@@ -87,6 +114,23 @@ impl<K, V> LoanMap<K, V>
         } else {
             None
         }
+    }
+
+    pub fn contains(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn get_mut(&self, key: &K) -> Option<WriteGuard<K, V>> {
+        if let Ok(inner) = OwningRefMut::new(OwningHandle::new_with_fn(
+            self.table.read().unwrap(),
+            |x| unsafe { &*x }.lookup_mut(key),
+        )).try_map_mut(|x| x.value_ref_mut())
+        {
+            Some(WriteGuard {inner: inner})
+        } else {
+            None
+        }
+
     }
 
     pub fn upsert<F>(&self, key: K, f: F) -> Option<V>
@@ -295,6 +339,14 @@ impl<K, V> Bucket<K, V> {
 
     fn value_ref(&self) -> Result<&V, ()> {
         if let Bucket::Contains(_, ref val) = *self {
+            Ok(val)
+        } else {
+            Err(())
+        }
+    }
+
+    fn value_ref_mut(&mut self) -> Result<&mut V, ()> {
+        if let Bucket::Contains(_, ref mut val) = *self {
             Ok(val)
         } else {
             Err(())
